@@ -1,17 +1,20 @@
 package relayer
 
 import (
+	"context"
 	"fmt"
 
-	chanState "github.com/cosmos/cosmos-sdk/x/ibc/04-channel/exported"
-	tmclient "github.com/cosmos/cosmos-sdk/x/ibc/07-tendermint/types"
-	"gopkg.in/yaml.v2"
+	clienttypes "github.com/cosmos/ibc-go/v4/modules/core/02-client/types"
+	conntypes "github.com/cosmos/ibc-go/v4/modules/core/03-connection/types"
+	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
 )
 
-var ( // Default identifiers for dummy usage
-	dcon = "defaultconnectionid"
-	dcha = "defaultchannelid"
-	dpor = "defaultportid"
+const (
+	check     = "✔"
+	xIcon     = "✘"
+	allowList = "allowlist"
+	denyList  = "denylist"
 )
 
 // Paths represent connection paths between chains
@@ -47,9 +50,6 @@ func (p Paths) MustGet(name string) *Path {
 
 // Add adds a path by its name
 func (p Paths) Add(name string, path *Path) error {
-	if err := path.Validate(); err != nil {
-		return err
-	}
 	if _, found := p[name]; found {
 		return fmt.Errorf("path with name %s already exists", name)
 	}
@@ -70,7 +70,8 @@ func (p *Path) MustYAML() string {
 func (p Paths) PathsFromChains(src, dst string) (Paths, error) {
 	out := Paths{}
 	for name, path := range p {
-		if (path.Dst.ChainID == src || path.Src.ChainID == src) && (path.Dst.ChainID == dst || path.Src.ChainID == dst) {
+		if (path.Dst.ChainID == src || path.Src.ChainID == src) &&
+			(path.Dst.ChainID == dst || path.Src.ChainID == dst) {
 			out[name] = path
 		}
 	}
@@ -80,37 +81,79 @@ func (p Paths) PathsFromChains(src, dst string) (Paths, error) {
 	return out, nil
 }
 
-// Path represents a pair of chains and the identifiers needed to
-// relay over them
+// PathAction is struct
+type PathAction struct {
+	*Path
+	Type string `json:"type"`
+}
+
+// Path represents a pair of chains and the identifiers needed to relay over them along with a channel filter list.
+// A Memo can optionally be provided for identification in relayed messages.
 type Path struct {
-	Src      *PathEnd     `yaml:"src" json:"src"`
-	Dst      *PathEnd     `yaml:"dst" json:"dst"`
-	Strategy *StrategyCfg `yaml:"strategy" json:"strategy"`
+	Src    *PathEnd      `yaml:"src" json:"src"`
+	Dst    *PathEnd      `yaml:"dst" json:"dst"`
+	Filter ChannelFilter `yaml:"src-channel-filter" json:"src-channel-filter"`
 }
 
-// Ordered returns true if the path is ordered and false if otherwise
-func (p *Path) Ordered() bool {
-	return p.Src.getOrder() == chanState.ORDERED
+// ChannelFilter provides the means for either creating an allowlist or a denylist of channels on the src chain
+// which will be used to narrow down the list of channels a user wants to relay on.
+type ChannelFilter struct {
+	Rule        string   `yaml:"rule" json:"rule"`
+	ChannelList []string `yaml:"channel-list" json:"channel-list"`
 }
 
-// Validate checks that a path is valid
-func (p *Path) Validate() (err error) {
-	if err = p.Src.Validate(); err != nil {
-		return err
-	}
-	if err = p.Dst.Validate(); err != nil {
-		return err
-	}
-	if _, err = p.GetStrategy(); err != nil {
-		return err
-	}
-	if p.Src.Order != p.Dst.Order {
-		return fmt.Errorf("Both sides must have same order ('ORDERED' or 'UNORDERED'), got src(%s) and dst(%s)", p.Src.Order, p.Dst.Order)
+type IBCdata struct {
+	Schema string `json:"$schema"`
+	Chain1 struct {
+		ChainName    string `json:"chain-name"`
+		ClientID     string `json:"client-id"`
+		ConnectionID string `json:"connection-id"`
+	} `json:"chain-1"`
+	Chain2 struct {
+		ChainName    string `json:"chain-name"`
+		ClientID     string `json:"client-id"`
+		ConnectionID string `json:"connection-id"`
+	} `json:"chain-2"`
+	Channels []struct {
+		Chain1 struct {
+			ChannelID string `json:"channel-id"`
+			PortID    string `json:"port-id"`
+		} `json:"chain-1"`
+		Chain2 struct {
+			ChannelID string `json:"channel-id"`
+			PortID    string `json:"port-id"`
+		} `json:"chain-2"`
+		Ordering string `json:"ordering"`
+		Version  string `json:"version"`
+		Tags     struct {
+			Status     string `json:"status"`
+			Preferred  bool   `json:"preferred"`
+			Dex        string `json:"dex"`
+			Properties string `json:"properties"`
+		} `json:"tags,omitempty"`
+	} `json:"channels"`
+}
+
+// ValidateChannelFilterRule verifies that the configured ChannelFilter rule is set to an appropriate value.
+func (p *Path) ValidateChannelFilterRule() error {
+	if p.Filter.Rule != allowList && p.Filter.Rule != denyList && p.Filter.Rule != "" {
+		return fmt.Errorf("%s is not a valid channel filter rule, please "+
+			"ensure your channel filter rule is `%s` or '%s'", p.Filter.Rule, allowList, denyList)
 	}
 	return nil
 }
 
-// End returns the proper end given a chainID
+// InChannelList returns true if the channelID argument is in the ChannelFilter's ChannelList or false otherwise.
+func (cf *ChannelFilter) InChannelList(channelID string) bool {
+	for _, channel := range cf.ChannelList {
+		if channel == channelID {
+			return true
+		}
+	}
+	return false
+}
+
+// End returns the proper end given a chainID.
 func (p *Path) End(chainID string) *PathEnd {
 	if p.Dst.ChainID == chainID {
 		return p.Dst
@@ -122,108 +165,126 @@ func (p *Path) End(chainID string) *PathEnd {
 }
 
 func (p *Path) String() string {
-	return fmt.Sprintf("[ ] %s ->\n %s", p.Src.String(), p.Dst.String())
+	return fmt.Sprintf("%s -> %s", p.Src.String(), p.Dst.String())
 }
 
-// GenPath generates a path with random client, connection and channel identifiers
-// given chainIDs and portIDs
-func GenPath(srcChainID, dstChainID, srcPortID, dstPortID, order string) *Path {
+// GenPath generates a path with unspecified client, connection and channel identifiers
+// given chainIDs and portIDs.
+func GenPath(srcChainID, dstChainID string) *Path {
 	return &Path{
 		Src: &PathEnd{
 			ChainID:      srcChainID,
-			ClientID:     RandLowerCaseLetterString(10),
-			ConnectionID: RandLowerCaseLetterString(10),
-			ChannelID:    RandLowerCaseLetterString(10),
-			PortID:       srcPortID,
-			Order:        order,
+			ClientID:     "",
+			ConnectionID: "",
 		},
 		Dst: &PathEnd{
 			ChainID:      dstChainID,
-			ClientID:     RandLowerCaseLetterString(10),
-			ConnectionID: RandLowerCaseLetterString(10),
-			ChannelID:    RandLowerCaseLetterString(10),
-			PortID:       dstPortID,
-			Order:        order,
-		},
-		Strategy: &StrategyCfg{
-			Type: "naive",
+			ClientID:     "",
+			ConnectionID: "",
 		},
 	}
 }
 
-// FindPaths returns all the open paths that exist between chains
-func FindPaths(chains Chains) (*Paths, error) {
-	var out = &Paths{}
-	hs, err := QueryLatestHeights(chains...)
-	if err != nil {
-		return nil, err
+// PathStatus holds the status of the primitives in the path
+type PathStatus struct {
+	Chains     bool `yaml:"chains" json:"chains"`
+	Clients    bool `yaml:"clients" json:"clients"`
+	Connection bool `yaml:"connection" json:"connection"`
+}
+
+// PathWithStatus is used for showing the status of the path
+type PathWithStatus struct {
+	Path   *Path      `yaml:"path" json:"chains"`
+	Status PathStatus `yaml:"status" json:"status"`
+}
+
+// QueryPathStatus returns an instance of the path struct with some attached data about
+// the current status of the path
+func (p *Path) QueryPathStatus(ctx context.Context, src, dst *Chain) *PathWithStatus {
+	var (
+		srch, dsth       int64
+		srcCs, dstCs     *clienttypes.QueryClientStateResponse
+		srcConn, dstConn *conntypes.QueryConnectionResponse
+
+		out = &PathWithStatus{Path: p, Status: PathStatus{false, false, false}}
+	)
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		var err error
+		srch, err = src.ChainProvider.QueryLatestHeight(egCtx)
+		return err
+	})
+	eg.Go(func() error {
+		var err error
+		dsth, err = dst.ChainProvider.QueryLatestHeight(egCtx)
+		return err
+	})
+	if err := eg.Wait(); err != nil {
+		return out
 	}
-	for _, src := range chains {
-		clients, err := src.QueryClients(1, 1000)
-		if err != nil {
-			return nil, err
-		}
-		for _, client := range clients {
-			clnt, ok := client.(tmclient.ClientState)
-			if !ok || clnt.LastHeader.Commit == nil || clnt.LastHeader.Header == nil {
-				continue
-			}
-			dst, err := chains.Get(client.GetChainID())
-			if err != nil {
-				continue
-			}
-
-			if err = src.AddPath(client.GetID(), dcon, dcha, dpor, "ORDERED"); err != nil {
-				return nil, err
-			}
-
-			conns, err := src.QueryConnectionsUsingClient(hs[src.ChainID])
-			if err != nil {
-				return nil, err
-			}
-
-			for _, connid := range conns.ConnectionPaths {
-				if err = src.AddPath(client.GetID(), connid, dcha, dpor, "ORDERED"); err != nil {
-					return nil, err
-				}
-				conn, err := src.QueryConnection(hs[src.ChainID])
-				if err != nil {
-					return nil, err
-				}
-				if conn.Connection.Connection.GetState().String() == "OPEN" {
-					chans, err := src.QueryConnectionChannels(connid, 1, 1000)
-					if err != nil {
-						return nil, err
-					}
-					for _, chn := range chans {
-						if chn.Channel.State.String() == "OPEN" {
-							p := &Path{
-								Src: &PathEnd{
-									ChainID:      src.ChainID,
-									ClientID:     client.GetID(),
-									ConnectionID: conn.Connection.Identifier,
-									ChannelID:    chn.ChannelIdentifier,
-									PortID:       chn.PortIdentifier,
-								},
-								Dst: &PathEnd{
-									ChainID:      dst.ChainID,
-									ClientID:     conn.Connection.Connection.GetCounterparty().GetClientID(),
-									ConnectionID: conn.Connection.Connection.GetCounterparty().GetConnectionID(),
-									ChannelID:    chn.Channel.GetCounterparty().GetChannelID(),
-									PortID:       chn.Channel.GetCounterparty().GetPortID(),
-								},
-								Strategy: &StrategyCfg{
-									Type: "naive",
-								},
-							}
-							if err = out.Add(fmt.Sprintf("%s-%s", src.ChainID, dst.ChainID), p); err != nil {
-								return nil, err
-							}
-						}
-					}
-				}
-			}
-		}
+	out.Status.Chains = true
+	if err := src.SetPath(p.Src); err != nil {
+		return out
 	}
-	return out, nil
+	if err := dst.SetPath(p.Dst); err != nil {
+		return out
+	}
+
+	eg, egCtx = errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		var err error
+		srcCs, err = src.ChainProvider.QueryClientStateResponse(egCtx, srch, src.ClientID())
+		return err
+	})
+	eg.Go(func() error {
+		var err error
+		dstCs, err = dst.ChainProvider.QueryClientStateResponse(egCtx, dsth, dst.ClientID())
+		return err
+	})
+	if err := eg.Wait(); err != nil || srcCs == nil || dstCs == nil {
+		return out
+	}
+	out.Status.Clients = true
+
+	eg, egCtx = errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		var err error
+		srcConn, err = src.ChainProvider.QueryConnection(egCtx, srch, src.ConnectionID())
+		return err
+	})
+	eg.Go(func() error {
+		var err error
+		dstConn, err = dst.ChainProvider.QueryConnection(egCtx, dsth, dst.ConnectionID())
+		return err
+	})
+	if err := eg.Wait(); err != nil || srcConn.Connection.State != conntypes.OPEN ||
+		dstConn.Connection.State != conntypes.OPEN {
+		return out
+	}
+	out.Status.Connection = true
+	return out
+}
+
+// PrintString prints a string representations of the path status
+func (ps *PathWithStatus) PrintString(name string) string {
+	pth := ps.Path
+	return fmt.Sprintf(`Path "%s":
+  SRC(%s)
+    ClientID:     %s
+    ConnectionID: %s
+  DST(%s)
+    ClientID:     %s
+    ConnectionID: %s
+  STATUS:
+    Chains:       %s
+    Clients:      %s
+    Connection:   %s`, name, pth.Src.ChainID, pth.Src.ClientID, pth.Src.ConnectionID, pth.Dst.ChainID, pth.Dst.ClientID,
+		pth.Dst.ConnectionID, checkmark(ps.Status.Chains), checkmark(ps.Status.Clients), checkmark(ps.Status.Connection))
+}
+
+func checkmark(status bool) string {
+	if status {
+		return check
+	}
+	return xIcon
 }

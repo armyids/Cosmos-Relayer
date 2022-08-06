@@ -1,9 +1,9 @@
 {
   "daemon": "gaiad",
-  "cli": "gaiacli",
+  "cli": "gaiad",
   "link": {
     "account-prefix": "cosmos",
-    "gas": 200000,
+    "gas-adjustment": 1.2,
     "gas-prices": "0.025stake",
     "default-denom": "stake",
     "trusting-period": "336h"

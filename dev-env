@@ -1,8 +1,7 @@
-#/bin/bash -e
-
-RELAYER_DIR="$GOPATH/src/github.com/iqlusioninc/relayer"
+#!/bin/bash -e
+RELAYER_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 RELAYER_CONF="$HOME/.relayer"
-GAIA_CONF="$RELAYER_DIR/data"
+GAIA_CONF="$(pwd)/data"
 
 # Ensure user understands what will be deleted
 if ([[ -d $RELAYER_CONF ]] || [[ -d $GAIA_CONF ]]) && [[ ! "$1" == "skip" ]]; then
@@ -15,8 +14,24 @@ fi
 
 cd $RELAYER_DIR
 rm -rf $RELAYER_CONF &> /dev/null
-bash scripts/three-chainz "local" "skip"
-bash scripts/config-three "skip"
+pwd
+bash scripts/two-chainz-wasmd "skip"
+
+echo "waiting for blocks..."
+sleep 3
+
+rly tx link demo -d -t 3s
 sleep 2
-rly tx link demo -o 3s
-rly tx link demo2 -o 3s -d
+echo "Initial balances"
+echo "balance 0 $(rly q bal ibc-0)"
+echo "balance 1 $(rly q bal ibc-1)"
+rly tx transfer ibc-0 ibc-1 100000samoleans "$(rly keys show ibc-1)" channel-0 -d
+rly tx transfer ibc-1 ibc-0 100000samoleans "$(rly keys show ibc-0)" channel-0 -d
+sleep 5
+rly tx relay-packets demo channel-0 -d
+sleep 5
+rly tx relay-acknowledgements demo channel-0 -d
+sleep 5
+echo "Balances after packets are sent"
+echo "balance 0 $(rly q bal ibc-0)"
+echo "balance 1 $(rly q bal ibc-1)"

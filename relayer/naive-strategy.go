@@ -1,333 +1,696 @@
 package relayer
 
 import (
+	"context"
 	"fmt"
-	"strconv"
+	"sync"
 
-	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/avast/retry-go/v4"
+	chantypes "github.com/cosmos/ibc-go/v4/modules/core/04-channel/types"
+	ibcexported "github.com/cosmos/ibc-go/v4/modules/core/exported"
+	"github.com/cosmos/relayer/v2/relayer/provider"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
-// NewNaiveStrategy returns the proper config for the NaiveStrategy
-func NewNaiveStrategy() *StrategyCfg {
-	return &StrategyCfg{
-		Type: (&NaiveStrategy{}).GetType(),
+// UnrelayedSequences returns the unrelayed sequence numbers between two chains
+func UnrelayedSequences(ctx context.Context, src, dst *Chain, srcChannel *chantypes.IdentifiedChannel) RelaySequences {
+	var (
+		srcPacketSeq = []uint64{}
+		dstPacketSeq = []uint64{}
+		rs           = RelaySequences{Src: []uint64{}, Dst: []uint64{}}
+	)
+
+	srch, dsth, err := QueryLatestHeights(ctx, src, dst)
+	if err != nil {
+		src.log.Error("Error querying latest heights", zap.Error(err))
+		return rs
 	}
-}
 
-// NaiveStrategy is an implementation of Strategy
-type NaiveStrategy struct {
-	Ordered bool
-}
-
-// GetType implements Strategy
-func (nrs *NaiveStrategy) GetType() string {
-	return "naive"
-}
-
-// UnrelayedSequencesOrdered returns the unrelayed sequence numbers between two chains
-func (nrs *NaiveStrategy) UnrelayedSequencesOrdered(src, dst *Chain, sh *SyncHeaders) (*RelaySequences, error) {
-	return UnrelayedSequences(src, dst, sh)
-}
-
-// UnrelayedSequencesUnordered returns the unrelayed sequence numbers between two chains
-func (nrs *NaiveStrategy) UnrelayedSequencesUnordered(src, dst *Chain, sh *SyncHeaders) (*RelaySequences, error) {
-	return UnrelayedSequences(src, dst, sh)
-}
-
-// HandleEvents defines how the relayer will handle block and transaction events as they are emmited
-func (nrs *NaiveStrategy) HandleEvents(src, dst *Chain, sh *SyncHeaders, events map[string][]string) {
-	rlyPackets, err := relayPacketsFromEventListener(src.PathEnd, dst.PathEnd, events)
-	if len(rlyPackets) > 0 && err == nil {
-		sendTxFromEventPackets(src, dst, rlyPackets, sh)
-	}
-}
-
-func relayPacketsFromEventListener(src, dst *PathEnd, events map[string][]string) (rlyPkts []relayPacket, err error) {
-	// check for send packets
-	if pdval, ok := events["send_packet.packet_data"]; ok {
-		for i, pd := range pdval {
-			// Ensure that we only relay over the channel and port specified
-			// OPTIONAL FEATURE: add additional filtering options
-			// Example Events - "transfer.amount(sdk.Coin)", "message.sender(sdk.AccAddress)"
-			srcChan, srcPort := events["send_packet.packet_src_channel"], events["send_packet.packet_src_port"]
-			dstChan, dstPort := events["send_packet.packet_dst_channel"], events["send_packet.packet_dst_port"]
-
-			// NOTE: Src and Dst are switched here
-			if dst.PortID == srcPort[i] && dst.ChannelID == srcChan[i] && src.PortID == dstPort[i] && src.ChannelID == dstChan[i] {
-				rp := &relayMsgRecvPacket{packetData: []byte(pd)}
-
-				// next, get and parse the sequence
-				if sval, ok := events["send_packet.packet_sequence"]; ok {
-					seq, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.seq = seq
-				}
-
-				// finally, get and parse the timeout
-				if sval, ok := events["send_packet.packet_timeout_height"]; ok {
-					timeout, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.timeout = timeout
-				}
-
-				// finally, get and parse the timeout
-				if sval, ok := events["send_packet.packet_timeout_timestamp"]; ok {
-					timeout, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.timeoutStamp = timeout
-				}
-
-				// queue the packet for return
-				rlyPkts = append(rlyPkts, rp)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		var (
+			res *chantypes.QueryPacketCommitmentsResponse
+			err error
+		)
+		if err = retry.Do(func() error {
+			// Query the packet commitment
+			res, err = src.ChainProvider.QueryPacketCommitments(ctx, uint64(srch), srcChannel.ChannelId, srcChannel.PortId)
+			switch {
+			case err != nil:
+				return err
+			case res == nil:
+				return fmt.Errorf("no error on QueryPacketCommitments for %s, however response is nil", src.ChainID())
+			default:
+				return nil
 			}
+		}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+			src.log.Info(
+				"Failed to query packet commitments",
+				zap.String("channel_id", srcChannel.ChannelId),
+				zap.String("port_id", srcChannel.PortId),
+				zap.Uint("attempt", n+1),
+				zap.Uint("max_attempts", RtyAttNum),
+				zap.Error(err),
+			)
+		})); err != nil {
+			src.log.Error(
+				"Failed to query packet commitments after max retries",
+				zap.String("channel_id", srcChannel.ChannelId),
+				zap.String("port_id", srcChannel.PortId),
+				zap.Uint("attempts", RtyAttNum),
+				zap.Error(err),
+			)
+			return
 		}
-	}
 
-	// then, check for packet acks
-	if pdval, ok := events["recv_packet.packet_data"]; ok {
-		for i, pd := range pdval {
-			// Ensure that we only relay over the channel and port specified
-			// OPTIONAL FEATURE: add additional filtering options
-			srcChan, srcPort := events["recv_packet.packet_src_channel"], events["recv_packet.packet_src_port"]
-			dstChan, dstPort := events["recv_packet.packet_dst_channel"], events["recv_packet.packet_dst_port"]
+		for _, pc := range res.Commitments {
+			srcPacketSeq = append(srcPacketSeq, pc.Sequence)
+		}
+	}()
 
-			// NOTE: Src and Dst are not switched here
-			if src.PortID == srcPort[i] && src.ChannelID == srcChan[i] && dst.PortID == dstPort[i] && dst.ChannelID == dstChan[i] {
-				rp := &relayMsgPacketAck{packetData: []byte(pd)}
-
-				// first get the ack
-				if ack, ok := events["recv_packet.packet_ack"]; ok {
-					rp.ack = []byte(ack[i])
-				}
-				// next, get and parse the sequence
-				if sval, ok := events["recv_packet.packet_sequence"]; ok {
-					seq, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.seq = seq
-				}
-
-				// finally, get and parse the timeout
-				if sval, ok := events["recv_packet.packet_timeout_height"]; ok {
-					timeout, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.timeout = timeout
-				}
-
-				// finally, get and parse the timeout
-				if sval, ok := events["recv_packet.packet_timeout_timestamp"]; ok {
-					timeout, err := strconv.ParseUint(sval[i], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					rp.timeoutStamp = timeout
-				}
-
-				// queue the packet for return
-				rlyPkts = append(rlyPkts, rp)
+	go func() {
+		defer wg.Done()
+		var (
+			res *chantypes.QueryPacketCommitmentsResponse
+			err error
+		)
+		if err = retry.Do(func() error {
+			res, err = dst.ChainProvider.QueryPacketCommitments(ctx, uint64(dsth), srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId)
+			switch {
+			case err != nil:
+				return err
+			case res == nil:
+				return fmt.Errorf("no error on QueryPacketCommitments for %s, however response is nil", dst.ChainID())
+			default:
+				return nil
 			}
+		}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+			dst.log.Info(
+				"Failed to query packet commitments",
+				zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+				zap.String("port_id", srcChannel.Counterparty.PortId),
+				zap.Uint("attempt", n+1),
+				zap.Uint("max_attempts", RtyAttNum),
+				zap.Error(err),
+			)
+		})); err != nil {
+			dst.log.Error(
+				"Failed to query packet commitments after max retries",
+				zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+				zap.String("port_id", srcChannel.Counterparty.PortId),
+				zap.Uint("attempts", RtyAttNum),
+				zap.Error(err),
+			)
+			return
 		}
-	}
-	return
-}
 
-func sendTxFromEventPackets(src, dst *Chain, rlyPackets []relayPacket, sh *SyncHeaders) {
-	// fetch the proofs for the relayPackets
-	for _, rp := range rlyPackets {
-		if err := rp.FetchCommitResponse(src, dst, sh); err != nil {
-			// we don't expect many errors here because of the retry
-			// in FetchCommitResponse
-			src.Error(err)
+		for _, pc := range res.Commitments {
+			dstPacketSeq = append(dstPacketSeq, pc.Sequence)
 		}
+	}()
+
+	wg.Wait()
+
+	var (
+		srcUnreceivedPackets, dstUnreceivedPackets []uint64
+	)
+
+	if len(srcPacketSeq) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Query all packets sent by src that have not been received by dst.
+			if err := retry.Do(func() error {
+				var err error
+				srcUnreceivedPackets, err = dst.ChainProvider.QueryUnreceivedPackets(ctx, uint64(dsth), srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId, srcPacketSeq)
+				return err
+			}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+				dst.log.Info(
+					"Failed to query unreceived packets",
+					zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+					zap.String("port_id", srcChannel.Counterparty.PortId),
+					zap.Uint("attempt", n+1),
+					zap.Uint("max_attempts", RtyAttNum),
+					zap.Error(err),
+				)
+			})); err != nil {
+				dst.log.Error(
+					"Failed to query unreceived packets after max retries",
+					zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+					zap.String("port_id", srcChannel.Counterparty.PortId),
+					zap.Uint("attempts", RtyAttNum),
+					zap.Error(err),
+				)
+			}
+		}()
 	}
 
-	// instantiate the RelayMsgs with the appropriate update client
-	txs := &RelayMsgs{
-		Src: []sdk.Msg{
-			src.PathEnd.UpdateClient(sh.GetHeader(dst.ChainID), src.MustGetAddress()),
-		},
-		Dst: []sdk.Msg{},
+	if len(dstPacketSeq) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Query all packets sent by dst that have not been received by src.
+			if err := retry.Do(func() error {
+				var err error
+				dstUnreceivedPackets, err = src.ChainProvider.QueryUnreceivedPackets(ctx, uint64(srch), srcChannel.ChannelId, srcChannel.PortId, dstPacketSeq)
+				return err
+			}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+				src.log.Info(
+					"Failed to query unreceived packets",
+					zap.String("channel_id", srcChannel.ChannelId),
+					zap.String("port_id", srcChannel.PortId),
+					zap.Uint("attempt", n+1),
+					zap.Uint("max_attempts", RtyAttNum),
+					zap.Error(err),
+				)
+			})); err != nil {
+				src.log.Error(
+					"Failed to query unreceived packets after max retries",
+					zap.String("channel_id", srcChannel.ChannelId),
+					zap.String("port_id", srcChannel.PortId),
+					zap.Uint("attempts", RtyAttNum),
+					zap.Error(err),
+				)
+				return
+			}
+		}()
+	}
+	wg.Wait()
+
+	// If this is an UNORDERED channel we can return at this point.
+	if srcChannel.Ordering != chantypes.ORDERED {
+		rs.Src = srcUnreceivedPackets
+		rs.Dst = dstUnreceivedPackets
+		return rs
 	}
 
-	// add the packet msgs to RelayPackets
-	for _, rp := range rlyPackets {
-		txs.Src = append(txs.Src, rp.Msg(src, dst))
+	// For ordered channels we want to only relay the packet whose sequence number is equal to
+	// the expected next packet receive sequence from the counterparty.
+	if len(srcUnreceivedPackets) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nextSeqResp, err := dst.ChainProvider.QueryNextSeqRecv(ctx, dsth, srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId)
+			if err != nil {
+				dst.log.Error(
+					"Failed to query next packet receive sequence",
+					zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+					zap.String("port_id", srcChannel.Counterparty.PortId),
+					zap.Error(err),
+				)
+				return
+			}
+
+			for _, seq := range srcUnreceivedPackets {
+				if seq == nextSeqResp.NextSequenceReceive {
+					rs.Src = append(rs.Src, seq)
+					break
+				}
+			}
+		}()
 	}
 
-	// send the transaction, maybe retry here if not successful
-	if txs.Send(src, dst); !txs.success {
-		src.Error(fmt.Errorf("failed to send packets, maybe we should add a retry here"))
+	if len(dstUnreceivedPackets) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nextSeqResp, err := src.ChainProvider.QueryNextSeqRecv(ctx, srch, srcChannel.ChannelId, srcChannel.PortId)
+			if err != nil {
+				src.log.Error(
+					"Failed to query next packet receive sequence",
+					zap.String("channel_id", srcChannel.ChannelId),
+					zap.String("port_id", srcChannel.PortId),
+					zap.Error(err),
+				)
+				return
+			}
+
+			for _, seq := range dstUnreceivedPackets {
+				if seq == nextSeqResp.NextSequenceReceive {
+					rs.Dst = append(rs.Dst, seq)
+					break
+				}
+			}
+		}()
 	}
+	wg.Wait()
+
+	return rs
 }
 
-// RelayPacketsUnorderedChan creates transactions to relay un-relayed messages
-func (nrs *NaiveStrategy) RelayPacketsUnorderedChan(src, dst *Chain, sp *RelaySequences, sh *SyncHeaders) error {
-	// TODO: Implement unordered channels
-	return nrs.RelayPacketsOrderedChan(src, dst, sp, sh)
+// UnrelayedAcknowledgements returns the unrelayed sequence numbers between two chains
+func UnrelayedAcknowledgements(ctx context.Context, src, dst *Chain, srcChannel *chantypes.IdentifiedChannel) RelaySequences {
+	var (
+		srcPacketSeq = []uint64{}
+		dstPacketSeq = []uint64{}
+		rs           = RelaySequences{Src: []uint64{}, Dst: []uint64{}}
+	)
+
+	srch, dsth, err := QueryLatestHeights(ctx, src, dst)
+	if err != nil {
+		src.log.Error("Error querying latest heights", zap.Error(err))
+		return rs
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		var (
+			res []*chantypes.PacketState
+			err error
+		)
+		if err = retry.Do(func() error {
+			// Query the packet commitment
+			res, err = src.ChainProvider.QueryPacketAcknowledgements(ctx, uint64(srch), srcChannel.ChannelId, srcChannel.PortId)
+			switch {
+			case err != nil:
+				return err
+			case res == nil:
+				return src.errQueryUnrelayedPacketAcks()
+			default:
+				return nil
+			}
+		}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr); err != nil {
+			src.log.Error(
+				"Failed to query packet acknowledgement commitments after max attempts",
+				zap.String("channel_id", srcChannel.ChannelId),
+				zap.String("port_id", srcChannel.PortId),
+				zap.Uint("attempts", RtyAttNum),
+				zap.Error(err),
+			)
+			return
+		}
+		for _, pc := range res {
+			srcPacketSeq = append(srcPacketSeq, pc.Sequence)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		var (
+			res []*chantypes.PacketState
+			err error
+		)
+		if err = retry.Do(func() error {
+			res, err = dst.ChainProvider.QueryPacketAcknowledgements(ctx, uint64(dsth), srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId)
+			switch {
+			case err != nil:
+				return err
+			case res == nil:
+				return dst.errQueryUnrelayedPacketAcks()
+			default:
+				return nil
+			}
+		}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr); err != nil {
+			dst.log.Error(
+				"Failed to query packet acknowledgement commitments after max attempts",
+				zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+				zap.String("port_id", srcChannel.Counterparty.PortId),
+				zap.Uint("attempts", RtyAttNum),
+				zap.Error(err),
+			)
+			return
+		}
+		for _, pc := range res {
+			dstPacketSeq = append(dstPacketSeq, pc.Sequence)
+		}
+	}()
+
+	wg.Wait()
+
+	if len(srcPacketSeq) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Query all packets sent by src that have been received by dst
+			var err error
+			if err := retry.Do(func() error {
+				rs.Src, err = dst.ChainProvider.QueryUnreceivedAcknowledgements(ctx, uint64(dsth), srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId, srcPacketSeq)
+				return err
+			}, retry.Context(ctx), RtyErr, RtyAtt, RtyDel); err != nil {
+				dst.log.Error(
+					"Failed to query unreceived acknowledgements after max attempts",
+					zap.String("channel_id", srcChannel.Counterparty.ChannelId),
+					zap.String("port_id", srcChannel.Counterparty.PortId),
+					zap.Uint("attempts", RtyAttNum),
+					zap.Error(err),
+				)
+			}
+		}()
+	}
+
+	if len(dstPacketSeq) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Query all packets sent by dst that have been received by src
+			var err error
+			if err := retry.Do(func() error {
+				rs.Dst, err = src.ChainProvider.QueryUnreceivedAcknowledgements(ctx, uint64(srch), srcChannel.ChannelId, srcChannel.PortId, dstPacketSeq)
+				return err
+			}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr); err != nil {
+				src.log.Error(
+					"Failed to query unreceived acknowledgements after max attempts",
+					zap.String("channel_id", srcChannel.ChannelId),
+					zap.String("port_id", srcChannel.PortId),
+					zap.Uint("attempts", RtyAttNum),
+					zap.Error(err),
+				)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return rs
 }
 
-// RelayPacketsOrderedChan creates transactions to clear both queues
-// CONTRACT: the SyncHeaders passed in here must be up to date or being kept updated
-func (nrs *NaiveStrategy) RelayPacketsOrderedChan(src, dst *Chain, sp *RelaySequences, sh *SyncHeaders) error {
+// RelaySequences represents unrelayed packets on src and dst
+type RelaySequences struct {
+	Src []uint64 `json:"src"`
+	Dst []uint64 `json:"dst"`
+}
 
-	// create the appropriate update client messages
-	msgs := &RelayMsgs{Src: []sdk.Msg{}, Dst: []sdk.Msg{}}
-	if len(sp.Src) > 0 {
-		msgs.Dst = append(msgs.Dst, dst.PathEnd.UpdateClient(sh.GetHeader(src.ChainID), dst.MustGetAddress()))
+func (rs *RelaySequences) Empty() bool {
+	if len(rs.Src) == 0 && len(rs.Dst) == 0 {
+		return true
 	}
-	if len(sp.Dst) > 0 {
-		msgs.Src = append(msgs.Src, src.PathEnd.UpdateClient(sh.GetHeader(dst.ChainID), src.MustGetAddress()))
+	return false
+}
+
+// RelayAcknowledgements creates transactions to relay acknowledgements from src to dst and from dst to src
+func RelayAcknowledgements(ctx context.Context, log *zap.Logger, src, dst *Chain, sp RelaySequences, maxTxSize, maxMsgLength uint64, memo string, srcChannel *chantypes.IdentifiedChannel) error {
+	// set the maximum relay transaction constraints
+	msgs := &RelayMsgs{
+		Src:          []provider.RelayerMessage{},
+		Dst:          []provider.RelayerMessage{},
+		MaxTxSize:    maxTxSize,
+		MaxMsgLength: maxMsgLength,
 	}
 
-	// add messages for src -> dst
-	for _, seq := range sp.Src {
-		msg, err := packetMsgFromTxQuery(src, dst, sh, seq)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		srch, dsth, err := QueryLatestHeights(ctx, src, dst)
 		if err != nil {
 			return err
 		}
-		msgs.Dst = append(msgs.Dst, msg)
-	}
 
-	// add messages for dst -> src
-	for _, seq := range sp.Dst {
-		msg, err := packetMsgFromTxQuery(dst, src, sh, seq)
+		var (
+			srcHeader, dstHeader ibcexported.Header
+		)
+		eg, egCtx := errgroup.WithContext(ctx)
+		eg.Go(func() error {
+			var err error
+			srcHeader, err = src.ChainProvider.GetIBCUpdateHeader(egCtx, srch, dst.ChainProvider, dst.PathEnd.ClientID)
+			return err
+		})
+		eg.Go(func() error {
+			var err error
+			dstHeader, err = dst.ChainProvider.GetIBCUpdateHeader(egCtx, dsth, src.ChainProvider, src.PathEnd.ClientID)
+			return err
+		})
+		if err := eg.Wait(); err != nil {
+			return err
+		}
+
+		srcUpdateMsg, err := src.ChainProvider.MsgUpdateClient(src.PathEnd.ClientID, dstHeader)
 		if err != nil {
 			return err
 		}
-		msgs.Src = append(msgs.Src, msg)
-	}
-
-	if !msgs.Ready() {
-		src.Log(fmt.Sprintf("- No packets to relay between [%s]port{%s} and [%s]port{%s}", src.ChainID, src.PathEnd.PortID, dst.ChainID, dst.PathEnd.PortID))
-		return nil
-	}
-
-	// TODO: increase the amount of gas as the number of messages increases
-	// notify the user of that
-	if msgs.Send(src, dst); msgs.success {
-		if len(msgs.Dst) > 1 {
-			dst.logPacketsRelayed(src, len(msgs.Dst)-1)
+		dstUpdateMsg, err := dst.ChainProvider.MsgUpdateClient(dst.PathEnd.ClientID, srcHeader)
+		if err != nil {
+			return err
 		}
-		if len(msgs.Src) > 1 {
-			src.logPacketsRelayed(dst, len(msgs.Src)-1)
+
+		// add messages for received packets on dst
+		for _, seq := range sp.Dst {
+			// dst wrote the ack. acknowledgementFromSequence will query the acknowledgement
+			// from the counterparty chain (second chain provided in the arguments). The message
+			// should be sent to src.
+			relayAckMsgs, err := src.ChainProvider.AcknowledgementFromSequence(ctx, dst.ChainProvider, uint64(dsth), seq, srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId, srcChannel.ChannelId, srcChannel.PortId)
+			if err != nil {
+				return err
+			}
+
+			// Do not allow nil messages to the queued, or else we will panic in send()
+			if relayAckMsgs != nil {
+				msgs.Src = append(msgs.Src, relayAckMsgs)
+			}
+		}
+
+		// add messages for received packets on src
+		for _, seq := range sp.Src {
+			// src wrote the ack. acknowledgementFromSequence will query the acknowledgement
+			// from the counterparty chain (second chain provided in the arguments). The message
+			// should be sent to dst.
+			relayAckMsgs, err := dst.ChainProvider.AcknowledgementFromSequence(ctx, src.ChainProvider, uint64(srch), seq, srcChannel.ChannelId, srcChannel.PortId, srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId)
+			if err != nil {
+				return err
+			}
+
+			// Do not allow nil messages to the queued, or else we will panic in send()
+			if relayAckMsgs != nil {
+				msgs.Dst = append(msgs.Dst, relayAckMsgs)
+			}
+		}
+
+		if !msgs.Ready() {
+			log.Info(
+				"No acknowledgements to relay",
+				zap.String("src_chain_id", src.ChainID()),
+				zap.String("src_port_id", srcChannel.PortId),
+				zap.String("dst_chain_id", dst.ChainID()),
+				zap.String("dst_port_id", srcChannel.Counterparty.PortId),
+			)
+			return nil
+		}
+
+		// Prepend non-empty msg lists with UpdateClient
+		if len(msgs.Dst) != 0 {
+			msgs.Dst = append([]provider.RelayerMessage{dstUpdateMsg}, msgs.Dst...)
+		}
+
+		if len(msgs.Src) != 0 {
+			msgs.Src = append([]provider.RelayerMessage{srcUpdateMsg}, msgs.Src...)
+		}
+
+		// send messages to their respective chains
+		result := msgs.Send(ctx, log, AsRelayMsgSender(src), AsRelayMsgSender(dst), memo)
+		if err := result.Error(); err != nil {
+			if result.PartiallySent() {
+				log.Info(
+					"Partial success when relaying acknowledgements",
+					zap.String("src_chain_id", src.ChainID()),
+					zap.String("src_port_id", srcChannel.PortId),
+					zap.String("dst_chain_id", dst.ChainID()),
+					zap.String("dst_port_id", srcChannel.Counterparty.PortId),
+					zap.Error(err),
+				)
+			}
+			return err
+		}
+
+		if result.SuccessfulSrcBatches > 0 {
+			src.logPacketsRelayed(dst, result.SuccessfulSrcBatches, srcChannel)
+		}
+		if result.SuccessfulDstBatches > 0 {
+			dst.logPacketsRelayed(src, result.SuccessfulDstBatches, srcChannel)
 		}
 	}
 
 	return nil
 }
 
-// packetMsgFromTxQuery returns a sdk.Msg to relay a packet with a given seq on src
-func packetMsgFromTxQuery(src, dst *Chain, sh *SyncHeaders, seq uint64) (sdk.Msg, error) {
-	eveSend, err := ParseEvents(fmt.Sprintf(defaultPacketSendQuery, src.PathEnd.ChannelID, seq))
-	if err != nil {
-		return nil, err
+// RelayPackets creates transactions to relay packets from src to dst and from dst to src
+func RelayPackets(ctx context.Context, log *zap.Logger, src, dst *Chain, sp RelaySequences, maxTxSize, maxMsgLength uint64, memo string, srcChannel *chantypes.IdentifiedChannel) error {
+	// set the maximum relay transaction constraints
+	msgs := &RelayMsgs{
+		Src:          []provider.RelayerMessage{},
+		Dst:          []provider.RelayerMessage{},
+		MaxTxSize:    maxTxSize,
+		MaxMsgLength: maxMsgLength,
 	}
 
-	tx, err := src.QueryTxs(sh.GetHeight(src.ChainID), 1, 1000, eveSend)
-	switch {
-	case err != nil:
-		return nil, err
-	case tx.Count == 0:
-		return nil, fmt.Errorf("no transactions returned with query")
-	case tx.Count > 1:
-		return nil, fmt.Errorf("more than one transaction returned with query")
-	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		srch, dsth, err := QueryLatestHeights(ctx, src, dst)
+		if err != nil {
+			return err
+		}
 
-	rlyPackets, err := relayPacketFromQueryResponse(src.PathEnd, dst.PathEnd, tx.Txs[0])
-	switch {
-	case err != nil:
-		return nil, err
-	case len(rlyPackets) == 0:
-		return nil, fmt.Errorf("no relay msgs created from query response")
-	case len(rlyPackets) > 1:
-		return nil, fmt.Errorf("more than one relay msg found in tx query")
-	}
+		eg, egCtx := errgroup.WithContext(ctx)
+		// add messages for sequences on src
+		eg.Go(func() error {
+			return AddMessagesForSequences(egCtx, sp.Src, src, dst, srch, dsth, &msgs.Src, &msgs.Dst,
+				srcChannel.ChannelId, srcChannel.PortId, srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId, srcChannel.Ordering)
+		})
 
-	// sanity check the sequence number against the one we are querying for
-	// TODO: move this into relayPacketFromQueryResponse?
-	if seq != rlyPackets[0].Seq() {
-		return nil, fmt.Errorf("Different sequence number from query (%d vs %d)", seq, rlyPackets[0].Seq())
-	}
+		// add messages for sequences on dst
+		eg.Go(func() error {
+			return AddMessagesForSequences(egCtx, sp.Dst, dst, src, dsth, srch, &msgs.Dst, &msgs.Src,
+				srcChannel.Counterparty.ChannelId, srcChannel.Counterparty.PortId, srcChannel.ChannelId, srcChannel.PortId, srcChannel.Ordering)
+		})
 
-	// fetch the proof from the sending chain
-	if err = rlyPackets[0].FetchCommitResponse(dst, src, sh); err != nil {
-		return nil, err
-	}
+		if err = eg.Wait(); err != nil {
+			return err
+		}
 
-	// return the sending msg
-	return rlyPackets[0].Msg(dst, src), nil
+		if !msgs.Ready() {
+			log.Info(
+				"No packets to relay",
+				zap.String("src_chain_id", src.ChainID()),
+				zap.String("src_port_id", srcChannel.PortId),
+				zap.String("dst_chain_id", dst.ChainID()),
+				zap.String("dst_port_id", srcChannel.Counterparty.PortId),
+			)
+			return nil
+		}
+
+		// Prepend non-empty msg lists with UpdateClient
+
+		eg, egCtx = errgroup.WithContext(ctx) // New errgroup because previous egCtx is canceled at this point.
+		eg.Go(func() error {
+			return PrependUpdateClientMsg(egCtx, &msgs.Dst, src, dst, srch)
+		})
+
+		eg.Go(func() error {
+			return PrependUpdateClientMsg(egCtx, &msgs.Src, dst, src, dsth)
+		})
+
+		if err = eg.Wait(); err != nil {
+			return err
+		}
+
+		// send messages to their respective chains
+		result := msgs.Send(ctx, log, AsRelayMsgSender(src), AsRelayMsgSender(dst), memo)
+		if err := result.Error(); err != nil {
+			if result.PartiallySent() {
+				log.Info(
+					"Partial success when relaying packets",
+					zap.String("src_chain_id", src.ChainID()),
+					zap.String("src_port_id", srcChannel.PortId),
+					zap.String("dst_chain_id", dst.ChainID()),
+					zap.String("dst_port_id", srcChannel.Counterparty.PortId),
+					zap.Error(err),
+				)
+			}
+			return err
+		}
+
+		if result.SuccessfulSrcBatches > 0 {
+			src.logPacketsRelayed(dst, result.SuccessfulSrcBatches, srcChannel)
+		}
+		if result.SuccessfulDstBatches > 0 {
+			dst.logPacketsRelayed(src, result.SuccessfulDstBatches, srcChannel)
+		}
+
+		return nil
+	}
 }
 
-// relayPacketFromQueryResponse looks through the events in a sdk.Response
-// and returns relayPackets with the appropriate data
-func relayPacketFromQueryResponse(src, dst *PathEnd, res sdk.TxResponse) (rlyPackets []relayPacket, err error) {
-	for _, l := range res.Logs {
-		for _, e := range l.Events {
-			if e.Type == "send_packet" {
-				// NOTE: Src and Dst are switched here
-				rp := &relayMsgRecvPacket{pass: false}
-				for _, p := range e.Attributes {
-					if p.Key == "packet_src_channel" {
-						if p.Value != src.ChannelID {
-							rp.pass = true
-							continue
-						}
-					}
-					if p.Key == "packet_dst_channel" {
-						if p.Value != dst.ChannelID {
-							rp.pass = true
-							continue
-						}
-					}
-					if p.Key == "packet_src_port" {
-						if p.Value != src.PortID {
-							rp.pass = true
-							continue
-						}
-					}
-					if p.Key == "packet_dst_port" {
-						if p.Value != dst.PortID {
-							rp.pass = true
-							continue
-						}
-					}
-					if p.Key == "packet_data" {
-						rp.packetData = []byte(p.Value)
-					}
-					if p.Key == "packet_timeout_height" {
-						timeout, _ := strconv.ParseUint(p.Value, 10, 64)
-						rp.timeout = timeout
-					}
-					if p.Key == "packet_timeout_timestamp" {
-						timeout, _ := strconv.ParseUint(p.Value, 10, 64)
-						rp.timeoutStamp = timeout
-					}
-					if p.Key == "packet_sequence" {
-						seq, _ := strconv.ParseUint(p.Value, 10, 64)
-						rp.seq = seq
-					}
-				}
+// AddMessagesForSequences constructs RecvMsgs and TimeoutMsgs from sequence numbers on a src chain
+// and adds them to the appropriate queue of msgs for both src and dst
+func AddMessagesForSequences(
+	ctx context.Context,
+	sequences []uint64,
+	src, dst *Chain,
+	srch, dsth int64,
+	srcMsgs, dstMsgs *[]provider.RelayerMessage,
+	srcChanID, srcPortID, dstChanID, dstPortID string,
+	order chantypes.Order,
+) error {
+	for _, seq := range sequences {
+		recvMsg, timeoutMsg, err := src.ChainProvider.RelayPacketFromSequence(
+			ctx,
+			src.ChainProvider, dst.ChainProvider,
+			uint64(srch), uint64(dsth),
+			seq,
+			dstChanID, dstPortID, dst.ClientID(),
+			srcChanID, srcPortID, src.ClientID(),
+			order,
+		)
+		if err != nil {
+			src.log.Info(
+				"Failed to relay packet from sequence",
+				zap.String("src_chain_id", src.ChainID()),
+				zap.String("src_channel_id", srcChanID),
+				zap.String("src_port_id", srcPortID),
+				zap.String("dst_chain_id", dst.ChainID()),
+				zap.String("dst_channel_id", dstChanID),
+				zap.String("dst_port_id", dstPortID),
+				zap.String("channel_order", order.String()),
+				zap.Error(err),
+			)
+			return err
+		}
 
-				// if we have decided not to relay this packet, don't add it
-				if !rp.pass {
-					rlyPackets = append(rlyPackets, rp)
-				}
-			}
+		// Depending on the type of message to be relayed, we need to send to different chains
+		if recvMsg != nil {
+			*dstMsgs = append(*dstMsgs, recvMsg)
+		}
+
+		if timeoutMsg != nil {
+			*srcMsgs = append(*srcMsgs, timeoutMsg)
 		}
 	}
 
-	if len(rlyPackets) > 0 {
-		return
+	return nil
+}
+
+// PrependUpdateClientMsg adds an UpdateClient msg to the front of non-empty msg lists
+func PrependUpdateClientMsg(ctx context.Context, msgs *[]provider.RelayerMessage, src, dst *Chain, srch int64) error {
+	if len(*msgs) == 0 {
+		return nil
 	}
 
-	return nil, fmt.Errorf("no packet data found")
+	// Query IBC Update Header
+	var srcHeader ibcexported.Header
+	if err := retry.Do(func() error {
+		var err error
+		srcHeader, err = src.ChainProvider.GetIBCUpdateHeader(ctx, srch, dst.ChainProvider, dst.PathEnd.ClientID)
+		return err
+	}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+		src.log.Info(
+			"PrependUpdateClientMsg: failed to get IBC update header",
+			zap.String("src_chain_id", src.ChainID()),
+			zap.String("dst_chain_id", dst.ChainID()),
+			zap.Uint("attempt", n+1),
+			zap.Uint("attempt_limit", RtyAttNum),
+			zap.Error(err),
+		)
+
+	})); err != nil {
+		return err
+	}
+
+	// Construct UpdateClient msg
+	var updateMsg provider.RelayerMessage
+	if err := retry.Do(func() error {
+		var err error
+		updateMsg, err = dst.ChainProvider.MsgUpdateClient(dst.PathEnd.ClientID, srcHeader)
+		return err
+	}, retry.Context(ctx), RtyAtt, RtyDel, RtyErr, retry.OnRetry(func(n uint, err error) {
+		dst.log.Info(
+			"PrependUpdateClientMsg: failed to build message",
+			zap.String("dst_chain_id", dst.ChainID()),
+			zap.Uint("attempt", n+1),
+			zap.Uint("attempt_limit", RtyAttNum),
+			zap.Error(err),
+		)
+	})); err != nil {
+		return err
+	}
+
+	// Prepend UpdateClient msg to the slice of msgs
+	*msgs = append([]provider.RelayerMessage{updateMsg}, *msgs...)
+
+	return nil
 }

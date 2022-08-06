@@ -2,703 +2,362 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"os"
+	"io"
+	"path"
+	"strings"
 
-	connTypes "github.com/cosmos/cosmos-sdk/x/ibc/03-connection/types"
-	chanTypes "github.com/cosmos/cosmos-sdk/x/ibc/04-channel/types"
-	tmclient "github.com/cosmos/cosmos-sdk/x/ibc/07-tendermint/types"
-	"github.com/iqlusioninc/relayer/relayer"
+	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/google/go-github/v43/github"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
-func pathsCmd() *cobra.Command {
+func pathsCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "paths",
 		Aliases: []string{"pth"},
-		Short:   "manage path configurations",
+		Short:   "Manage path configurations",
 		Long: `
-A path represents the "full path" or "link" for communication between two chains. This includes the client, 
-connection, and channel ids from both the source and destination chains as well as the strategy to use when relaying`,
+A path represents the "full path" or "link" for communication between two chains. 
+This includes the client, connection, and channel ids from both the source and destination chains as well as the strategy to use when relaying`,
 	}
 
 	cmd.AddCommand(
-		pathsListCmd(),
-		pathsShowCmd(),
-		pathsAddCmd(),
-		pathsGenCmd(),
-		pathsDeleteCmd(),
-		pathsFindCmd(),
+		pathsListCmd(a),
+		pathsShowCmd(a),
+		pathsAddCmd(a),
+		pathsAddDirCmd(a),
+		pathsNewCmd(a),
+		pathsFetchCmd(a),
+		pathsDeleteCmd(a),
 	)
 
 	return cmd
 }
 
-func pathsFindCmd() *cobra.Command {
+func pathsDeleteCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "find",
-		Short: "WIP: finds any existing paths between any configured chains and outputs them to stdout",
-		Args:  cobra.ExactArgs(0),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			paths, err := relayer.FindPaths(config.Chains)
-			if err != nil {
-				return err
-			}
-			return config.Chains[0].Print(paths, false, false)
-		},
-	}
-	return cmd
-}
-
-func pathsGenCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:     "generate [src-chain-id] [src-port] [dst-chain-id] [dst-port] [name]",
-		Aliases: []string{"gen"},
-		Short:   "generate identifiers for a new path between src and dst, reusing any that exist",
-		Args:    cobra.ExactArgs(5),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			src, srcPort, dst, dstPort := args[0], args[1], args[2], args[3]
-			path := &relayer.Path{
-				Src: &relayer.PathEnd{
-					ChainID: src,
-					PortID:  srcPort,
-				},
-				Dst: &relayer.PathEnd{
-					ChainID: dst,
-					PortID:  dstPort,
-				},
-				Strategy: &relayer.StrategyCfg{
-					Type: "naive",
-				},
-			}
-			c, err := config.Chains.Gets(src, dst)
-			if err != nil {
-				return fmt.Errorf("chains need to be configured before paths to them can be added: %w", err)
-			}
-
-			unordered, err := cmd.Flags().GetBool(flagOrder)
-			if err != nil {
-				return nil
-			}
-
-			if unordered {
-				path.Src.Order = "UNORDERED"
-				path.Dst.Order = "UNORDERED"
-			} else {
-				path.Src.Order = "ORDERED"
-				path.Dst.Order = "ORDERED"
-			}
-
-			srcClients, err := c[src].QueryClients(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			for _, c := range srcClients {
-				// TODO: support other client types through a switch here as they become available
-				clnt, ok := c.(tmclient.ClientState)
-				if ok && clnt.LastHeader.Commit != nil && clnt.LastHeader.Header != nil {
-					if clnt.GetChainID() == dst && !clnt.IsFrozen() {
-						path.Src.ClientID = c.GetID()
-					}
-				}
-			}
-
-			dstClients, err := c[dst].QueryClients(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			for _, c := range dstClients {
-				// TODO: support other client types through a switch here as they become available
-				clnt, ok := c.(tmclient.ClientState)
-				if ok && clnt.LastHeader.Commit != nil && clnt.LastHeader.Header != nil {
-					if c.GetChainID() == src && !c.IsFrozen() {
-						path.Dst.ClientID = c.GetID()
-					}
-				}
-			}
-
-			switch {
-			case path.Src.ClientID == "" && path.Dst.ClientID == "":
-				path.Src.ClientID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ClientID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			case path.Src.ClientID == "" && path.Dst.ClientID != "":
-				path.Src.ClientID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			case path.Dst.ClientID == "" && path.Src.ClientID != "":
-				path.Dst.ClientID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			}
-
-			srcConns, err := c[src].QueryConnections(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			var srcCon connTypes.IdentifiedConnectionEnd
-			for _, c := range srcConns {
-				if c.Connection.ClientID == path.Src.ClientID {
-					srcCon = c
-					path.Src.ConnectionID = c.Identifier
-				}
-			}
-
-			dstConns, err := c[dst].QueryConnections(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			var dstCon connTypes.IdentifiedConnectionEnd
-			for _, c := range dstConns {
-				if c.Connection.ClientID == path.Dst.ClientID {
-					dstCon = c
-					path.Dst.ConnectionID = c.Identifier
-				}
-			}
-
-			switch {
-			case path.Src.ConnectionID != "" && path.Dst.ConnectionID != "":
-				// If we have identified a connection, make sure that each end is the
-				// other's counterparty and that the connection is open. In the failure case
-				// we should generate a new connection identifier
-				dstCpForSrc := srcCon.Connection.Counterparty.ConnectionID == dstCon.Identifier
-				srcCpForDst := dstCon.Connection.Counterparty.ConnectionID == srcCon.Identifier
-				srcOpen := srcCon.Connection.GetState().String() == "OPEN"
-				dstOpen := dstCon.Connection.GetState().String() == "OPEN"
-				if !(dstCpForSrc && srcCpForDst && srcOpen && dstOpen) {
-					path.Src.ConnectionID = relayer.RandLowerCaseLetterString(10)
-					path.Dst.ConnectionID = relayer.RandLowerCaseLetterString(10)
-					path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-					path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-					if err = config.Paths.Add(args[4], path); err != nil {
-						return err
-					}
-					return overWriteConfig(cmd, config)
-				}
-			default:
-				path.Src.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ConnectionID = relayer.RandLowerCaseLetterString(10)
-				path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			}
-
-			srcChans, err := c[src].QueryChannels(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			var srcChan chanTypes.IdentifiedChannel
-			for _, c := range srcChans {
-				if c.Channel.ConnectionHops[0] == path.Src.ConnectionID {
-					srcChan = c
-					path.Src.ChannelID = c.ChannelIdentifier
-				}
-			}
-
-			dstChans, err := c[dst].QueryChannels(1, 1000)
-			if err != nil {
-				return err
-			}
-
-			var dstChan chanTypes.IdentifiedChannel
-			for _, c := range dstChans {
-				if c.Channel.ConnectionHops[0] == path.Dst.ConnectionID {
-					dstChan = c
-					path.Dst.ChannelID = c.ChannelIdentifier
-				}
-			}
-
-			switch {
-			case path.Src.ChannelID != "" && path.Dst.ChannelID != "":
-				dstCpForSrc := srcChan.Channel.Counterparty.ChannelID == dstChan.ChannelIdentifier
-				srcCpForDst := dstChan.Channel.Counterparty.ChannelID == srcChan.ChannelIdentifier
-				srcOpen := srcChan.Channel.GetState().String() == "OPEN"
-				dstOpen := dstChan.Channel.GetState().String() == "OPEN"
-				srcPort := srcChan.PortIdentifier == path.Src.PortID
-				dstPort := dstChan.PortIdentifier == path.Dst.PortID
-				srcOrder := srcChan.Channel.Ordering.String() == path.Src.Order
-				dstOrder := dstChan.Channel.Ordering.String() == path.Dst.Order
-				if !(dstCpForSrc && srcCpForDst && srcOpen && dstOpen && srcPort && dstPort && srcOrder && dstOrder) {
-					path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-					path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				}
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			default:
-				path.Src.ChannelID = relayer.RandLowerCaseLetterString(10)
-				path.Dst.ChannelID = relayer.RandLowerCaseLetterString(10)
-				if err = config.Paths.Add(args[4], path); err != nil {
-					return err
-				}
-				return overWriteConfig(cmd, config)
-			}
-		},
-	}
-	return orderFlag(cmd)
-}
-
-func pathsDeleteCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:     "delete [index]",
+		Use:     "delete index",
 		Aliases: []string{"d"},
-		Short:   "delete a path with a given index",
-		Args:    cobra.ExactArgs(1),
+		Short:   "Delete a path with a given index",
+		Args:    withUsage(cobra.ExactArgs(1)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths delete demo-path
+$ %s pth d path-name`, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if _, err := config.Paths.Get(args[0]); err != nil {
+			if _, err := a.Config.Paths.Get(args[0]); err != nil {
 				return err
 			}
-			cfg := config
-			delete(cfg.Paths, args[0])
-			return overWriteConfig(cmd, cfg)
+			delete(a.Config.Paths, args[0])
+			return a.OverwriteConfig(a.Config)
 		},
 	}
 	return cmd
 }
 
-func pathsListCmd() *cobra.Command {
+func pathsListCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"l"},
-		Short:   "print out configured paths",
+		Short:   "Print out configured paths",
+		Args:    withUsage(cobra.NoArgs),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths list --yaml
+$ %s paths list --json
+$ %s pth l`, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			jsn, err := cmd.Flags().GetBool(flagJSON)
-			if err != nil {
-				return err
-			}
-			yml, err := cmd.Flags().GetBool(flagYAML)
-			if err != nil {
-				return err
-			}
+			jsn, _ := cmd.Flags().GetBool(flagJSON)
+			yml, _ := cmd.Flags().GetBool(flagYAML)
 			switch {
 			case yml && jsn:
 				return fmt.Errorf("can't pass both --json and --yaml, must pick one")
 			case yml:
-				out, err := yaml.Marshal(config.Paths)
+				out, err := yaml.Marshal(a.Config.Paths)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			case jsn:
-				out, err := json.Marshal(config.Paths)
+				out, err := json.Marshal(a.Config.Paths)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			default:
 				i := 0
-				for k, pth := range config.Paths {
-					// TODO: replace this with relayer.QueryPathStatus
-					var (
-						chains     = "✘"
-						clients    = "✘"
-						connection = "✘"
-						channel    = "✘"
-					)
-					src, dst := pth.Src.ChainID, pth.Dst.ChainID
-					ch, err := config.Chains.Gets(src, dst)
-					if err == nil {
-						chains = "✔"
-						err = ch[src].SetPath(pth.Src)
-						if err != nil {
-							printPath(i, k, pth, chains, clients, connection, channel)
-							i++
-							continue
-						}
-						err = ch[dst].SetPath(pth.Dst)
-						if err != nil {
-							printPath(i, k, pth, chains, clients, connection, channel)
-							i++
-							continue
-						}
-					} else {
-						printPath(i, k, pth, chains, clients, connection, channel)
-						i++
-						continue
+				for k, pth := range a.Config.Paths {
+					chains, err := a.Config.Chains.Gets(pth.Src.ChainID, pth.Dst.ChainID)
+					if err != nil {
+						return err
 					}
+					stat := pth.QueryPathStatus(cmd.Context(), chains[pth.Src.ChainID], chains[pth.Dst.ChainID]).Status
 
-					srcCs, err := ch[src].QueryClientState()
-					dstCs, _ := ch[dst].QueryClientState()
-					if err == nil && srcCs != nil && dstCs != nil {
-						clients = "✔"
-					} else {
-						printPath(i, k, pth, chains, clients, connection, channel)
-						i++
-						continue
-					}
+					printPath(cmd.OutOrStdout(), i, k, pth, checkmark(stat.Chains), checkmark(stat.Clients),
+						checkmark(stat.Connection))
 
-					srch, err := ch[src].QueryLatestHeight()
-					dsth, _ := ch[dst].QueryLatestHeight()
-					if err != nil || srch == -1 || dsth == -1 {
-						printPath(i, k, pth, chains, clients, connection, channel)
-						i++
-						continue
-					}
-
-					srcConn, err := ch[src].QueryConnection(srch)
-					dstConn, _ := ch[dst].QueryConnection(dsth)
-					if err == nil && srcConn.Connection.Connection.State.String() == "OPEN" && dstConn.Connection.Connection.State.String() == "OPEN" {
-						connection = "✔"
-					} else {
-						printPath(i, k, pth, chains, clients, connection, channel)
-						i++
-						continue
-					}
-
-					srcChan, err := ch[src].QueryChannel(srch)
-					dstChan, _ := ch[dst].QueryChannel(dsth)
-					if err == nil && srcChan.Channel.Channel.State.String() == "OPEN" && dstChan.Channel.Channel.State.String() == "OPEN" {
-						channel = "✔"
-					} else {
-						printPath(i, k, pth, chains, clients, connection, channel)
-						i++
-						continue
-					}
-
-					printPath(i, k, pth, chains, clients, connection, channel)
 					i++
 				}
 				return nil
 			}
 		},
 	}
-	return yamlFlag(jsonFlag(cmd))
+	return yamlFlag(a.Viper, jsonFlag(a.Viper, cmd))
 }
 
-func printPath(i int, k string, pth *relayer.Path, chains, clients, connection, channel string) {
-	fmt.Printf("%2d: %-20s -> chns(%s) clnts(%s) conn(%s) chan(%s) (%s:%s<>%s:%s)\n",
-		i, k, chains, clients, connection, channel, pth.Src.ChainID, pth.Src.PortID, pth.Dst.ChainID, pth.Dst.PortID)
-}
-
-type PathStatus struct {
-	Chains     bool `yaml:"chains" json:"chains"`
-	Clients    bool `yaml:"clients" json:"clients"`
-	Connection bool `yaml:"connection" json:"connection"`
-	Channel    bool `yaml:"channel" json:"channel"`
-}
-
-type PathWithStatus struct {
-	Path   *relayer.Path `yaml:"path" json:"chains"`
-	Status PathStatus    `yaml:"status" json:"status"`
+func printPath(stdout io.Writer, i int, k string, pth *relayer.Path, chains, clients, connection string) {
+	fmt.Fprintf(stdout, "%2d: %-20s -> chns(%s) clnts(%s) conn(%s) (%s<>%s)\n",
+		i, k, chains, clients, connection, pth.Src.ChainID, pth.Dst.ChainID)
 }
 
 func checkmark(status bool) string {
 	if status {
-		return "✔"
+		return check
 	}
-	return "✘"
+	return xIcon
 }
 
-func pathsShowCmd() *cobra.Command {
+func pathsShowCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "show [path-name]",
+		Use:     "show path_name",
 		Aliases: []string{"s"},
-		Short:   "show a path given its name",
-		Args:    cobra.ExactArgs(1),
+		Short:   "Show a path given its name",
+		Args:    withUsage(cobra.ExactArgs(1)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths show demo-path --yaml
+$ %s paths show demo-path --json
+$ %s pth s path-name`, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, err := config.Paths.Get(args[0])
+			p, err := a.Config.Paths.Get(args[0])
 			if err != nil {
 				return err
 			}
-
-			jsn, err := cmd.Flags().GetBool(flagJSON)
+			chains, err := a.Config.Chains.Gets(p.Src.ChainID, p.Dst.ChainID)
 			if err != nil {
 				return err
 			}
-			yml, err := cmd.Flags().GetBool(flagYAML)
-			if err != nil {
-				return err
-			}
-			if yml && jsn {
-				return fmt.Errorf("can't pass both --json and --yaml, must pick one")
-			}
-			// TODO: transition this to use relayer.QueryPathStatus
-			var (
-				chains     = false
-				clients    = false
-				connection = false
-				channel    = false
-				srch, dsth int64
-			)
-			src, dst := path.Src.ChainID, path.Dst.ChainID
-			ch, err := config.Chains.Gets(src, dst)
-			if err == nil {
-				srch, err = ch[src].QueryLatestHeight()
-				dsth, _ = ch[dst].QueryLatestHeight()
-				if err == nil {
-					chains = true
-					_ = ch[src].SetPath(path.Src)
-					_ = ch[dst].SetPath(path.Dst)
-				}
-			}
-
-			srcCs, err := ch[src].QueryClientState()
-			dstCs, _ := ch[dst].QueryClientState()
-			if err == nil && srcCs != nil && dstCs != nil {
-				clients = true
-			}
-
-			srcConn, err := ch[src].QueryConnection(srch)
-			dstConn, _ := ch[dst].QueryConnection(dsth)
-			if err == nil && srcConn.Connection.Connection.State.String() == "OPEN" && dstConn.Connection.Connection.State.String() == "OPEN" {
-				connection = true
-			}
-
-			srcChan, err := ch[src].QueryChannel(srch)
-			dstChan, _ := ch[dst].QueryChannel(dsth)
-			if err == nil && srcChan.Channel.Channel.State.String() == "OPEN" && dstChan.Channel.Channel.State.String() == "OPEN" {
-				channel = true
-			}
-
-			pathStatus := PathStatus{
-				Chains:     chains,
-				Clients:    clients,
-				Connection: connection,
-				Channel:    channel,
-			}
-			pathWithStatus := PathWithStatus{
-				Path:   path,
-				Status: pathStatus,
-			}
+			jsn, _ := cmd.Flags().GetBool(flagJSON)
+			yml, _ := cmd.Flags().GetBool(flagYAML)
+			pathWithStatus := p.QueryPathStatus(cmd.Context(), chains[p.Src.ChainID], chains[p.Dst.ChainID])
 			switch {
+			case yml && jsn:
+				return fmt.Errorf("can't pass both --json and --yaml, must pick one")
 			case yml:
 				out, err := yaml.Marshal(pathWithStatus)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			case jsn:
 				out, err := json.Marshal(pathWithStatus)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			default:
-				fmt.Printf(`Path "%s" strategy(%s):
-  SRC(%s)
-    ClientID:     %s
-    ConnectionID: %s
-    ChannelID:    %s
-    PortID:       %s
-  DST(%s)
-    ClientID:     %s
-    ConnectionID: %s
-    ChannelID:    %s
-    PortID:       %s
-  STATUS:
-    Chains:       %s
-    Clients:      %s
-    Connection:   %s
-    Channel:      %s
-`, args[0], path.Strategy.Type, path.Src.ChainID, path.Src.ClientID, path.Src.ConnectionID, path.Src.ChannelID, path.Src.PortID,
-					path.Dst.ChainID, path.Dst.ClientID, path.Dst.ConnectionID, path.Dst.ChannelID, path.Dst.PortID,
-					checkmark(chains), checkmark(clients), checkmark(connection), checkmark(channel))
+				fmt.Fprintln(cmd.OutOrStdout(), pathWithStatus.PrintString(args[0]))
 			}
 
 			return nil
 		},
 	}
-	return yamlFlag(jsonFlag(cmd))
+	return yamlFlag(a.Viper, jsonFlag(a.Viper, cmd))
 }
 
-func pathsAddCmd() *cobra.Command {
+func pathsAddCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "add [src-chain-id] [dst-chain-id] [path-name]",
+		Use:     "add src_chain_id dst_chain_id path_name",
 		Aliases: []string{"a"},
-		Short:   "add a path to the list of paths",
-		Args:    cobra.ExactArgs(3),
+		Short:   "Add a path to the list of paths",
+		Args:    withUsage(cobra.ExactArgs(3)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths add ibc-0 ibc-1 demo-path
+$ %s paths add ibc-0 ibc-1 demo-path --file paths/demo.json
+$ %s pth a ibc-0 ibc-1 demo-path`, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			src, dst := args[0], args[1]
-			_, err := config.Chains.Gets(src, dst)
+			_, err := a.Config.Chains.Gets(src, dst)
 			if err != nil {
 				return fmt.Errorf("chains need to be configured before paths to them can be added: %w", err)
 			}
 
-			var out *Config
 			file, err := cmd.Flags().GetString(flagFile)
 			if err != nil {
 				return err
 			}
 
 			if file != "" {
-				if out, err = fileInputPathAdd(file, args[2]); err != nil {
+				if err := a.AddPathFromFile(cmd.Context(), cmd.ErrOrStderr(), file, args[2]); err != nil {
 					return err
 				}
 			} else {
-				if out, err = userInputPathAdd(src, dst, args[2]); err != nil {
+				if err := a.AddPathFromUserInput(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), src, dst, args[2]); err != nil {
 					return err
 				}
 			}
 
-			return overWriteConfig(cmd, out)
+			return a.OverwriteConfig(a.Config)
 		},
 	}
-	return fileFlag(cmd)
+	return fileFlag(a.Viper, cmd)
 }
 
-func fileInputPathAdd(file, name string) (cfg *Config, err error) {
-	// If the user passes in a file, attempt to read the chain config from that file
-	p := &relayer.Path{}
-	if _, err := os.Stat(file); err != nil {
-		return nil, err
+func pathsAddDirCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "add-dir dir",
+		Args:  withUsage(cobra.ExactArgs(1)),
+		Short: `Add path configuration data in bulk from a directory. Example dir: 'configs/demo/paths'`,
+		Long: `Add path configuration data in bulk from a directory housing individual path config files. This is useful for spinning up testnets.
+		
+		See 'configs/demo/paths' for an example of individual path config files.`,
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s config add-paths configs/paths`, appName)),
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			if err := addPathsFromDirectory(cmd.Context(), cmd.ErrOrStderr(), a, args[0]); err != nil {
+				return err
+			}
+			return a.OverwriteConfig(a.Config)
+		},
 	}
 
-	byt, err := ioutil.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = json.Unmarshal(byt, &p); err != nil {
-		return nil, err
-	}
-
-	if err = config.Paths.Add(name, p); err != nil {
-		return nil, err
-	}
-
-	return config, nil
+	return cmd
 }
 
-func userInputPathAdd(src, dst, name string) (*Config, error) {
-	var (
-		value string
-		err   error
-		path  = &relayer.Path{
-			Strategy: relayer.NewNaiveStrategy(),
-			Src: &relayer.PathEnd{
-				ChainID: src,
-			},
-			Dst: &relayer.PathEnd{
-				ChainID: dst,
-			},
-		}
-	)
+func pathsNewCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "new src_chain_id dst_chain_id path_name",
+		Aliases: []string{"n"},
+		Short:   "Create a new blank path to be used in generating a new path (connection & client) between two chains",
+		Args:    withUsage(cobra.ExactArgs(3)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths new ibc-0 ibc-1 demo-path
+$ %s pth n ibc-0 ibc-1 demo-path`, appName, appName)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			src, dst := args[0], args[1]
+			_, err := a.Config.Chains.Gets(src, dst)
+			if err != nil {
+				return fmt.Errorf("chains need to be configured before paths to them can be added: %w", err)
+			}
 
-	fmt.Printf("enter src(%s) client-id...\n", src)
-	if value, err = readStdin(); err != nil {
-		return nil, err
+			p := &relayer.Path{
+				Src: &relayer.PathEnd{ChainID: src},
+				Dst: &relayer.PathEnd{ChainID: dst},
+			}
+
+			name := args[2]
+			if err = a.Config.Paths.Add(name, p); err != nil {
+				return err
+			}
+
+			return a.OverwriteConfig(a.Config)
+		},
 	}
+	return channelParameterFlags(a.Viper, cmd)
+}
 
-	path.Src.ClientID = value
+// pathsFetchCmd attempts to fetch the json files containing the path metadata, for each configured chain, from GitHub
+func pathsFetchCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "fetch",
+		Aliases: []string{"fch"},
+		Short:   "Fetches the json files necessary to setup the paths for the configured chains",
+		Args:    withUsage(cobra.NoArgs),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s paths fetch --home %s
+$ %s pth fch`, appName, defaultHome, appName)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			overwrite, _ := cmd.Flags().GetBool(flagOverwriteConfig)
 
-	if err = path.Src.Vclient(); err != nil {
-		return nil, err
+			chains := []string{}
+			for chainName := range a.Config.Chains {
+				chains = append(chains, chainName)
+			}
+
+			// find all combinations of paths for configured chains
+			chainCombinations := make(map[string]bool)
+			for _, chainA := range chains {
+				for _, chainB := range chains {
+					if chainA == chainB {
+						continue
+					}
+
+					pair := chainA + "-" + chainB
+					if chainB < chainA {
+						pair = chainB + "-" + chainA
+					}
+					chainCombinations[pair] = true
+				}
+			}
+
+			client := github.NewClient(nil)
+			for pthName := range chainCombinations {
+				_, exist := a.Config.Paths[pthName]
+				if exist && !overwrite {
+					fmt.Fprintf(cmd.ErrOrStderr(), "skipping:  %s already exists in config, use -o to overwrite (clears filters)\n", pthName)
+					continue
+				}
+
+				// TODO: Don't use github api. Potentially use: https://github.com/eco-stake/cosmos-directory once they integrate IBC data into restAPI. This will avoid rate limits.
+				fileName := pthName + ".json"
+				regPath := path.Join("_IBC", fileName)
+				client, _, err := client.Repositories.DownloadContents(cmd.Context(), "cosmos", "chain-registry", regPath, nil)
+				if err != nil {
+					if errors.As(err, new(*github.RateLimitError)) {
+						fmt.Println("some paths failed: ", err)
+						break
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(), "failure retrieving: %s: consider adding to cosmos/chain-registry: ERR: %v\n", pthName, err)
+					continue
+				}
+				defer client.Close()
+
+				b, err := io.ReadAll(client)
+				if err != nil {
+					return fmt.Errorf("error reading response body: %w", err)
+				}
+
+				ibc := &relayer.IBCdata{}
+				if err = json.Unmarshal(b, &ibc); err != nil {
+					return fmt.Errorf("failed to unmarshal: %w ", err)
+				}
+
+				srcChainName := ibc.Chain1.ChainName
+				dstChainName := ibc.Chain2.ChainName
+
+				srcPathEnd := &relayer.PathEnd{
+					ChainID:      a.Config.Chains[srcChainName].ChainID(),
+					ClientID:     ibc.Chain1.ClientID,
+					ConnectionID: ibc.Chain1.ConnectionID,
+				}
+				dstPathEnd := &relayer.PathEnd{
+					ChainID:      a.Config.Chains[dstChainName].ChainID(),
+					ClientID:     ibc.Chain2.ClientID,
+					ConnectionID: ibc.Chain2.ConnectionID,
+				}
+				newPath := &relayer.Path{
+					Src: srcPathEnd,
+					Dst: dstPathEnd,
+				}
+				client.Close()
+
+				if err = a.Config.AddPath(pthName, newPath); err != nil {
+					return fmt.Errorf("failed to add path %s: %w", pthName, err)
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "added:  %s\n", pthName)
+
+			}
+
+			if err := a.OverwriteConfig(a.Config); err != nil {
+				return err
+			}
+			return nil
+
+		},
 	}
-
-	fmt.Printf("enter src(%s) connection-id...\n", src)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Src.ConnectionID = value
-
-	if err = path.Src.Vconn(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter src(%s) channel-id...\n", src)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Src.ChannelID = value
-
-	if err = path.Src.Vchan(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter src(%s) port-id...\n", src)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Src.PortID = value
-
-	if err = path.Src.Vport(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter dst(%s) client-id...\n", dst)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Dst.ClientID = value
-
-	if err = path.Dst.Vclient(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter dst(%s) connection-id...\n", dst)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Dst.ConnectionID = value
-
-	if err = path.Dst.Vconn(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter dst(%s) channel-id...\n", dst)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Dst.ChannelID = value
-
-	if err = path.Dst.Vchan(); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("enter dst(%s) port-id...\n", dst)
-	if value, err = readStdin(); err != nil {
-		return nil, err
-	}
-
-	path.Dst.PortID = value
-
-	if err = path.Dst.Vport(); err != nil {
-		return nil, err
-	}
-
-	if err = config.Paths.Add(name, path); err != nil {
-		return nil, err
-	}
-
-	return config, nil
+	return OverwriteConfigFlag(a.Viper, cmd)
 }

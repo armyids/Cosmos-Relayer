@@ -3,19 +3,18 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"runtime"
+	"runtime/debug"
+	"strings"
 
-	"github.com/sirkon/goproxy/gomod"
+	"github.com/cosmos/relayer/v2/internal/relaydebug"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var (
 	// Version defines the application version (defined at compile time)
 	Version = ""
-	// Commit defines the application commit hash (defined at compile time)
-	Commit = ""
 )
 
 type versionInfo struct {
@@ -25,31 +24,37 @@ type versionInfo struct {
 	Go        string `json:"go" yaml:"go"`
 }
 
-func getVersionCmd() *cobra.Command {
+func getVersionCmd(a *appState) *cobra.Command {
 	versionCmd := &cobra.Command{
 		Use:     "version",
 		Aliases: []string{"v"},
-		Short:   "Print relayer version info",
+		Short:   "Print the relayer version info",
+		Args:    withUsage(cobra.NoArgs),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s version --json
+$ %s v`,
+			appName, appName,
+		)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			modBz, err := ioutil.ReadFile("go.mod")
-			if err != nil {
-				return err
-			}
-
-			mod, err := gomod.Parse("go.mod", modBz)
-			if err != nil {
-				return err
-			}
-
 			jsn, err := cmd.Flags().GetBool(flagJSON)
 			if err != nil {
 				return err
 			}
 
+			cosmosSDK := "(unable to determine)"
+			if bi, ok := debug.ReadBuildInfo(); ok {
+				for _, dep := range bi.Deps {
+					if dep.Path == "github.com/cosmos/cosmos-sdk" {
+						cosmosSDK = dep.Version
+						break
+					}
+				}
+			}
+
 			verInfo := versionInfo{
 				Version:   Version,
-				Commit:    Commit,
-				CosmosSDK: mod.Require["github.com/cosmos/cosmos-sdk"],
+				Commit:    relaydebug.BuildCommit(),
+				CosmosSDK: cosmosSDK,
 				Go:        fmt.Sprintf("%s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH),
 			}
 
@@ -60,9 +65,10 @@ func getVersionCmd() *cobra.Command {
 				bz, err = yaml.Marshal(&verInfo)
 			}
 
-			fmt.Println(string(bz))
+			fmt.Fprintln(cmd.OutOrStdout(), string(bz))
 			return err
 		},
 	}
-	return jsonFlag(versionCmd)
+
+	return jsonFlag(a.Viper, versionCmd)
 }
